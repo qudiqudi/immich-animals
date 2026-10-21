@@ -242,3 +242,112 @@ def test_ping_reports_an_unreachable_upstream(tmp_path, monkeypatch):
     response = TestClient(serve.app).get("/ping")
 
     assert response.status_code == 503
+
+
+def _plain_serve(tmp_path, monkeypatch, **env):
+    _constant_model(
+        tmp_path / "detector.onnx",
+        [1, 3, 640, 640],
+        np.zeros((1, 1, 6), np.float32),
+        names="{0: 'dog'}",
+    )
+    _embedder(tmp_path, "embedding", np.ones(512, np.float32))
+    return _load_serve(tmp_path, monkeypatch, **env)
+
+
+def test_people_without_an_upstream_refuse_to_start(tmp_path, monkeypatch):
+    # Animals alone would look like a full answer, and a face refresh in Immich
+    # deletes the human faces it does not find again.
+    monkeypatch.delenv("UPSTREAM_ML_URL", raising=False)
+    try:
+        _plain_serve(tmp_path, monkeypatch, KEEP_HUMAN_FACES="true")
+    except SystemExit as error:
+        assert "UPSTREAM_ML_URL" in str(error)
+    else:
+        raise AssertionError("serve started without an upstream")
+
+
+def test_root_answers_while_upstream_is_down(tmp_path, monkeypatch):
+    def handler(request):
+        raise httpx.ConnectError("Connection refused", request=request)
+
+    serve = _upstream_serve(tmp_path, monkeypatch, handler)
+    client = TestClient(serve.app)
+
+    assert client.get("/").status_code == 200
+    assert client.get("/ping").status_code == 503
+
+
+def test_embedder_batches_are_capped(tmp_path, monkeypatch):
+    rows = [[i * 60, 10, i * 60 + 50, 60, 0.9, 0] for i in range(5)]
+    _constant_model(
+        tmp_path / "detector.onnx",
+        [1, 3, 640, 640],
+        np.array([rows], np.float32),
+        names="{0: 'dog'}",
+    )
+    _embedder(tmp_path, "embedding", np.ones(512, np.float32))
+    serve = _load_serve(
+        tmp_path, monkeypatch, KEEP_HUMAN_FACES="false", EMBED_BATCH="2"
+    )
+    session = serve.embedders["embedding"].session
+    sizes = []
+
+    class Recording:
+        def run(self, outputs, feeds):
+            sizes.append(len(next(iter(feeds.values()))))
+            return session.run(outputs, feeds)
+
+    serve.embedders["embedding"] = serve.embedders["embedding"]._replace(
+        session=Recording()
+    )
+    response = TestClient(serve.app).post(
+        "/predict", data={"entries": json.dumps(ENTRIES)}, files={"image": _image()}
+    )
+
+    assert len(response.json()["facial-recognition"]) == 5
+    assert sizes == [2, 2, 1]
+
+
+def test_animal_inference_runs_one_photo_at_a_time(tmp_path, monkeypatch):
+    serve = _plain_serve(tmp_path, monkeypatch, KEEP_HUMAN_FACES="false")
+    running, peak, lock = [0], [0], threading.Lock()
+
+    def detect(rgb):
+        with lock:
+            running[0] += 1
+            peak[0] = max(peak[0], running[0])
+        threading.Event().wait(0.1)
+        with lock:
+            running[0] -= 1
+        return []
+
+    monkeypatch.setattr(serve, "_detect", detect)
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=serve.app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://t"
+        ) as client:
+            return await asyncio.gather(*(_predict(client) for _ in range(3)))
+
+    responses = asyncio.run(scenario())
+    assert [r.status_code for r in responses] == [200] * 3
+    assert peak[0] == 1
+
+
+def test_upstream_connect_timeout_is_separate_from_read(tmp_path, monkeypatch):
+    serve = _plain_serve(
+        tmp_path,
+        monkeypatch,
+        UPSTREAM_ML_URL="http://upstream",
+        UPSTREAM_TIMEOUT="300",
+        UPSTREAM_CONNECT_TIMEOUT="2",
+    )
+
+    async def timeout():
+        async with serve._lifespan(serve.app):
+            return serve._client.timeout
+
+    result = asyncio.run(timeout())
+    assert (result.connect, result.read) == (2, 300)
