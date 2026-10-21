@@ -19,6 +19,9 @@ permissions:
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/animal-ml
+  # Fork: the models stay on the upstream release, the image tag is our own.
+  MODEL_REPO: rtp4jc/immich-animals
+  MODEL_TAG: sidecar-v0.3.0
 
 jobs:
   build:
@@ -49,8 +52,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download "${{ steps.meta.outputs.tag }}" \
-            --repo "${{ github.repository }}" \
+          gh release download "$MODEL_TAG" \
+            --repo "$MODEL_REPO" \
             --pattern '*.onnx' --pattern 'embedding*.json' \
             --dir /tmp/models
           cd /tmp/models && sha256sum -c "$GITHUB_WORKSPACE/sidecar/SHA256SUMS"
@@ -68,7 +71,7 @@ jobs:
           context: .
           file: sidecar/Dockerfile
           platforms: ${{ matrix.platform }}
-          build-args: MODEL_TAG=${{ steps.meta.outputs.tag }}
+          build-args: MODEL_TAG=${{ env.MODEL_TAG }}
           load: true
           tags: animal-ml:ci
 
@@ -92,7 +95,7 @@ jobs:
           context: .
           file: sidecar/Dockerfile
           platforms: ${{ matrix.platform }}
-          build-args: MODEL_TAG=${{ steps.meta.outputs.tag }}
+          build-args: MODEL_TAG=${{ env.MODEL_TAG }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
 
       # Artifact paths cannot contain a colon, so store the bare digest.
