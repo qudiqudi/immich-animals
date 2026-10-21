@@ -14,10 +14,14 @@ retune settings that are already right for people.
 
 import ast
 import asyncio
+import ctypes
+import gc
 import hashlib
 import json
 import logging
 import os
+import threading
+import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -58,6 +62,8 @@ UPSTREAM_CONNECT_TIMEOUT = float(os.environ.get("UPSTREAM_CONNECT_TIMEOUT", "5")
 INFERENCE_CONCURRENCY = int(os.environ.get("INFERENCE_CONCURRENCY", "1"))
 # Caps the embedder batch, and with it peak memory, for photos with many animals.
 EMBED_BATCH = int(os.environ.get("EMBED_BATCH", "8"))
+# Seconds without a request after which the models are unloaded; 0 keeps them.
+MODEL_TTL = float(os.environ.get("MODEL_TTL", "0"))
 
 if KEEP_HUMAN_FACES and not UPSTREAM_URL:
     # Answering with animals only would look like a complete result, and an Immich
@@ -129,24 +135,85 @@ def _species(name: str) -> _Species:
     )
 
 
-detector, _det_input, _det_size = _session("detector.onnx")
-# Ultralytics writes class names as a Python dict literal, e.g. "{0: 'dog'}".
-_class_names = ast.literal_eval(detector.get_modelmeta().custom_metadata_map["names"])
-species = {
-    class_id: _species(name)
-    for class_id, name in _class_names.items()
-    if name in SPECIES_DEFAULTS
-}
-embedders = {
-    stem: _load_embedder(stem) for stem in {s.embedder_stem for s in species.values()}
-}
+class _Models(NamedTuple):
+    detector: ort.InferenceSession
+    det_input: str
+    det_size: tuple[int, int]
+    species: dict[int, _Species]
+    embedders: dict[str, _Embedder]
+
+
+def _load_models() -> _Models:
+    detector, det_input, det_size = _session("detector.onnx")
+    # Ultralytics writes class names as a Python dict literal, e.g. "{0: 'dog'}".
+    names = ast.literal_eval(detector.get_modelmeta().custom_metadata_map["names"])
+    species = {
+        class_id: _species(name)
+        for class_id, name in names.items()
+        if name in SPECIES_DEFAULTS
+    }
+    embedders = {
+        stem: _load_embedder(stem)
+        for stem in {s.embedder_stem for s in species.values()}
+    }
+    return _Models(detector, det_input, det_size, species, embedders)
+
+
+# Loaded at import so bad model files fail the start, not the first photo.
+_models: _Models | None = _load_models()
+_models_lock = threading.Lock()
+_models_in_use = 0
+_models_last_used = time.monotonic()
+
+
+def _acquire_models() -> _Models:
+    global _models, _models_in_use
+    with _models_lock:
+        if _models is None:
+            _models = _load_models()
+        _models_in_use += 1
+        return _models
+
+
+def _release_models() -> None:
+    global _models_in_use, _models_last_used
+    with _models_lock:
+        _models_in_use -= 1
+        _models_last_used = time.monotonic()
+
+
+def _unload_idle_models() -> bool:
+    global _models
+    with _models_lock:
+        idle = time.monotonic() - _models_last_used
+        if _models is None or _models_in_use or idle < MODEL_TTL:
+            return False
+        _models = None
+    # Dropping the sessions frees ONNX Runtime's arenas; glibc keeps the freed
+    # pages until asked to give them back.
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+    return True
+
+
+async def _unload_models_when_idle() -> None:
+    log = logging.getLogger("uvicorn.error")
+    while True:
+        await anyio.sleep(min(MODEL_TTL, 10))
+        if await anyio.to_thread.run_sync(_unload_idle_models):
+            log.info("animal-ml: models unloaded after %.0f s idle", MODEL_TTL)
 
 
 def _detect(rgb: np.ndarray) -> list[tuple[float, list[int], _Species]]:
     """Known-species detections above that species' min score, bbox in source pixels."""
     height, width = rgb.shape[:2]
-    blob, scale, left, top = letterbox(rgb, _det_size)
-    raw = detector.run(None, {_det_input: blob})
+    models = _models  # held by _acquire_models for the whole request
+    species = models.species
+    blob, scale, left, top = letterbox(rgb, models.det_size)
+    raw = models.detector.run(None, {models.det_input: blob})
     return [
         (
             float(score),
@@ -183,7 +250,7 @@ def _embed(crops: list[tuple[np.ndarray, _Species]]) -> list[np.ndarray]:
     for i, (_, kind) in enumerate(crops):
         by_stem[kind.embedder_stem].append(i)
     for stem, all_indices in by_stem.items():
-        embedder = embedders[stem]
+        embedder = _models.embedders[stem]
         for start in range(0, len(all_indices), EMBED_BATCH):
             indices = all_indices[start : start + EMBED_BATCH]
             batch = np.concatenate(
@@ -230,7 +297,13 @@ async def _lifespan(app: FastAPI):
     global _client
     timeout = httpx.Timeout(UPSTREAM_TIMEOUT, connect=UPSTREAM_CONNECT_TIMEOUT)
     async with httpx.AsyncClient(timeout=timeout) as _client:
-        yield
+        if MODEL_TTL <= 0:
+            yield
+            return
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(_unload_models_when_idle)
+            yield
+            tasks.cancel_scope.cancel()
 
 
 app = FastAPI(lifespan=_lifespan)
@@ -242,7 +315,7 @@ logging.getLogger("uvicorn.error").info(
         f"{s.name}: min score {s.min_score:.2f}, Max Distance {IMMICH_MAX_DISTANCE:.2f}"
         f" acts as {s.max_distance if 0 < s.shift < 1 else IMMICH_MAX_DISTANCE:.2f},"
         f" {s.embedder_stem}.onnx"
-        for s in species.values()
+        for s in _models.species.values()
     ),
 )
 
@@ -303,6 +376,14 @@ def _decode(data: bytes) -> np.ndarray:
 
 
 def _animal_faces(rgb: np.ndarray) -> list[dict]:
+    _acquire_models()
+    try:
+        return _animal_faces_with_models(rgb)
+    finally:
+        _release_models()
+
+
+def _animal_faces_with_models(rgb: np.ndarray) -> list[dict]:
     height, width = rgb.shape[:2]
     boxes, crops = [], []
     for score, bbox, kind in _detect(rgb):
