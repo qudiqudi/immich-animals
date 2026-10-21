@@ -290,7 +290,7 @@ def test_embedder_batches_are_capped(tmp_path, monkeypatch):
     serve = _load_serve(
         tmp_path, monkeypatch, KEEP_HUMAN_FACES="false", EMBED_BATCH="2"
     )
-    session = serve.embedders["embedding"].session
+    session = serve._models.embedders["embedding"].session
     sizes = []
 
     class Recording:
@@ -298,9 +298,9 @@ def test_embedder_batches_are_capped(tmp_path, monkeypatch):
             sizes.append(len(next(iter(feeds.values()))))
             return session.run(outputs, feeds)
 
-    serve.embedders["embedding"] = serve.embedders["embedding"]._replace(
-        session=Recording()
-    )
+    serve._models.embedders["embedding"] = serve._models.embedders[
+        "embedding"
+    ]._replace(session=Recording())
     response = TestClient(serve.app).post(
         "/predict", data={"entries": json.dumps(ENTRIES)}, files={"image": _image()}
     )
@@ -351,3 +351,28 @@ def test_upstream_connect_timeout_is_separate_from_read(tmp_path, monkeypatch):
 
     result = asyncio.run(timeout())
     assert (result.connect, result.read) == (2, 300)
+
+
+def test_idle_models_are_unloaded_and_reloaded(tmp_path, monkeypatch):
+    serve = _plain_serve(
+        tmp_path, monkeypatch, KEEP_HUMAN_FACES="false", MODEL_TTL="60"
+    )
+    client = TestClient(serve.app)
+
+    def predict():
+        return client.post(
+            "/predict", data={"entries": json.dumps(ENTRIES)}, files={"image": _image()}
+        )
+
+    assert predict().status_code == 200
+    assert not serve._unload_idle_models()  # used just now
+    serve._models_last_used -= 61
+    serve._acquire_models()
+    assert not serve._unload_idle_models()  # a request still holds them
+    serve._release_models()
+    serve._models_last_used -= 61
+    assert serve._unload_idle_models()
+    assert serve._models is None
+
+    assert predict().status_code == 200
+    assert serve._models is not None
