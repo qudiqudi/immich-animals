@@ -71,6 +71,12 @@ if KEEP_HUMAN_FACES and not UPSTREAM_URL:
     raise SystemExit(
         "animal-ml: UPSTREAM_ML_URL is required while KEEP_HUMAN_FACES is true"
     )
+if INFERENCE_CONCURRENCY < 1 or EMBED_BATCH < 1:
+    # 0 would make face requests wait forever, and a negative batch would answer
+    # with empty embeddings.
+    raise SystemExit(
+        "animal-ml: INFERENCE_CONCURRENCY and EMBED_BATCH must be at least 1"
+    )
 
 
 def _session(name: str) -> tuple[ort.InferenceSession, str, tuple[int, int]]:
@@ -358,10 +364,18 @@ async def predict(request: Request) -> Response:
     rgb = await anyio.to_thread.run_sync(_decode, await form["image"].read())
     # ONNX runs in a worker thread so the event loop keeps serving pings, CLIP and
     # the upstream face request while animals are inferred.
-    animals, humans = await asyncio.gather(
-        anyio.to_thread.run_sync(_animal_faces, rgb, limiter=_inference_limiter()),
-        _human_faces(body, content_type),
+    inference = asyncio.create_task(
+        anyio.to_thread.run_sync(_animal_faces, rgb, limiter=_inference_limiter())
     )
+    try:
+        humans = await _human_faces(body, content_type)
+    except BaseException:
+        # A photo still waiting for the limiter is dropped; one already running
+        # finishes in its thread, and its result is discarded.
+        inference.cancel()
+        await asyncio.gather(inference, return_exceptions=True)
+        raise
+    animals = await inference
     height, width = rgb.shape[:2]
     return ORJSONResponse(
         {TASK: animals + humans, "imageHeight": height, "imageWidth": width}
@@ -409,17 +423,30 @@ def _animal_faces_with_models(rgb: np.ndarray) -> list[dict]:
 async def _human_faces(body: bytes, content_type: str) -> list[dict]:
     if not KEEP_HUMAN_FACES:
         return []
+    # Without the human faces the answer is incomplete, so fail the request: Immich
+    # tries its next URL, or the next Face Detection run picks the photo up again.
     upstream = await _post_upstream(body, content_type)
-    upstream.raise_for_status()
-    return orjson.loads(upstream.content).get(TASK, [])
+    try:
+        upstream.raise_for_status()
+        faces = orjson.loads(upstream.content)[TASK]
+    except (httpx.HTTPStatusError, orjson.JSONDecodeError, KeyError, TypeError):
+        faces = None
+    if not isinstance(faces, list):
+        raise HTTPException(
+            503, f"Upstream ML answered {upstream.status_code} without faces"
+        )
+    return faces
 
 
 async def _post_upstream(body: bytes, content_type: str) -> httpx.Response:
     if not UPSTREAM_URL:
         raise HTTPException(503, "UPSTREAM_ML_URL is not set")
-    return await _upstream(
-        "POST", "/predict", content=body, headers={"content-type": content_type}
-    )
+    try:
+        return await _upstream(
+            "POST", "/predict", content=body, headers={"content-type": content_type}
+        )
+    except httpx.TransportError as error:
+        raise HTTPException(503, f"Upstream ML unavailable: {error!r}") from error
 
 
 async def _upstream(method: str, path: str, **kwargs) -> httpx.Response:

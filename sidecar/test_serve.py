@@ -376,3 +376,101 @@ def test_idle_models_are_unloaded_and_reloaded(tmp_path, monkeypatch):
 
     assert predict().status_code == 200
     assert serve._models is not None
+
+
+def test_faces_are_refused_while_upstream_is_down(tmp_path, monkeypatch):
+    # Animals alone would look like a full answer to a face refresh.
+    def handler(request):
+        raise httpx.ConnectError("Connection refused", request=request)
+
+    serve = _upstream_serve(tmp_path, monkeypatch, handler)
+    response = TestClient(serve.app).post(
+        "/predict", data={"entries": json.dumps(ENTRIES)}, files={"image": _image()}
+    )
+
+    assert response.status_code == 503
+    assert "facial-recognition" not in response.text
+
+
+def test_invalid_limits_refuse_to_start(tmp_path, monkeypatch):
+    for env in ({"INFERENCE_CONCURRENCY": "0"}, {"EMBED_BATCH": "-1"}):
+        try:
+            _plain_serve(tmp_path, monkeypatch, KEEP_HUMAN_FACES="false", **env)
+        except SystemExit as error:
+            assert "at least 1" in str(error)
+        else:
+            raise AssertionError(f"serve started with {env}")
+        for key in env:
+            monkeypatch.delenv(key)
+
+
+def test_lifespan_unloads_idle_models(tmp_path, monkeypatch):
+    serve = _plain_serve(
+        tmp_path, monkeypatch, KEEP_HUMAN_FACES="false", MODEL_TTL="0.1"
+    )
+
+    with TestClient(serve.app) as client:
+        for _ in range(50):
+            if serve._models is None:
+                break
+            threading.Event().wait(0.05)
+        assert serve._models is None
+        response = client.post(
+            "/predict", data={"entries": json.dumps(ENTRIES)}, files={"image": _image()}
+        )
+        assert response.status_code == 200
+
+
+def test_upstream_answers_without_faces_are_refused(tmp_path, monkeypatch):
+    bodies = iter([b'{"clip": "[0.1]"}', b"not json", b'{"facial-recognition": []}'])
+
+    def handler(request):
+        return httpx.Response(200, content=next(bodies))
+
+    serve = _upstream_serve(tmp_path, monkeypatch, handler)
+    client = TestClient(serve.app)
+
+    def predict():
+        return client.post(
+            "/predict", data={"entries": json.dumps(ENTRIES)}, files={"image": _image()}
+        )
+
+    assert [predict().status_code for _ in range(3)] == [503, 503, 200]
+
+
+def test_passthrough_answers_503_while_upstream_is_down(tmp_path, monkeypatch):
+    def handler(request):
+        raise httpx.ConnectTimeout("timed out", request=request)
+
+    serve = _upstream_serve(tmp_path, monkeypatch, handler)
+    response = TestClient(serve.app).post(
+        "/predict",
+        data={"entries": json.dumps({"clip": {}})},
+        files={"image": _image()},
+    )
+
+    assert response.status_code == 503
+
+
+def test_queued_inference_is_dropped_when_upstream_fails(tmp_path, monkeypatch):
+    def handler(request):
+        raise httpx.ConnectError("Connection refused", request=request)
+
+    serve = _upstream_serve(tmp_path, monkeypatch, handler)
+    detected = []
+    monkeypatch.setattr(serve, "_detect", lambda rgb: detected.append(1) or [])
+
+    async def scenario():
+        limiter = serve._inference_limiter()
+        await limiter.acquire()  # another photo holds the only slot
+        transport = httpx.ASGITransport(app=serve.app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://t"
+        ) as client:
+            response = await _predict(client)
+        limiter.release()
+        await asyncio.sleep(0.1)
+        return response
+
+    assert asyncio.run(scenario()).status_code == 503
+    assert detected == []
