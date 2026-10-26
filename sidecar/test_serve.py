@@ -570,3 +570,61 @@ def test_invalid_face_log_min_score_refuses_to_start(tmp_path, monkeypatch):
         assert "between 0 and 1" in str(error)
     else:
         raise AssertionError("serve started with FACE_LOG_MIN_SCORE=1.5")
+
+
+def test_animal_log_keeps_weak_animals_with_their_embedding(tmp_path, monkeypatch):
+    rows = [
+        [10, 10, 100, 100, 0.50, 0],  # dog above DOG_MIN_SCORE: answered
+        [200, 200, 300, 300, 0.20, 0],  # weak dog: logged with its embedding only
+        [400, 400, 500, 500, 0.10, 0],  # below ANIMAL_LOG_MIN_SCORE: dropped
+    ]
+    _constant_model(
+        tmp_path / "detector.onnx",
+        [1, 3, 640, 640],
+        np.array([rows], np.float32),
+        names="{0: 'dog'}",
+    )
+    _embedder(tmp_path, "embedding", np.ones(512, np.float32))
+    log_path = tmp_path / "faces.jsonl"
+    serve = _load_serve(
+        tmp_path,
+        monkeypatch,
+        KEEP_HUMAN_FACES="false",
+        ANIMAL_LOG_MIN_SCORE="0.15",
+        FACE_LOG_PATH=str(log_path),
+    )
+
+    response = TestClient(serve.app).post(
+        "/predict", data={"entries": json.dumps(ENTRIES)}, files={"image": _image()}
+    )
+
+    answered = response.json()["facial-recognition"]
+    assert [round(f["score"], 2) for f in answered] == [0.5]
+    record = json.loads(log_path.read_text().splitlines()[-1])
+    assert "faces" not in record  # human logging is off
+    animals = {round(a["score"], 2): a for a in record["animals"]}
+    assert set(animals) == {0.5, 0.2}
+    assert animals[0.5]["species"] == "dog" and "embedding" not in animals[0.5]
+    assert len(json.loads(animals[0.2]["embedding"])) == 512
+
+
+def test_animal_detection_is_unchanged_without_animal_log(tmp_path, monkeypatch):
+    rows = [[10, 10, 100, 100, 0.50, 0], [200, 200, 300, 300, 0.20, 0]]
+    _constant_model(
+        tmp_path / "detector.onnx",
+        [1, 3, 640, 640],
+        np.array([rows], np.float32),
+        names="{0: 'dog'}",
+    )
+    _embedder(tmp_path, "embedding", np.ones(512, np.float32))
+    monkeypatch.delenv("ANIMAL_LOG_MIN_SCORE", raising=False)
+    serve = _load_serve(tmp_path, monkeypatch, KEEP_HUMAN_FACES="false")
+
+    response = TestClient(serve.app).post(
+        "/predict", data={"entries": json.dumps(ENTRIES)}, files={"image": _image()}
+    )
+
+    assert [round(f["score"], 2) for f in response.json()["facial-recognition"]] == [
+        0.5
+    ]
+    assert serve._face_log is None

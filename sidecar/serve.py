@@ -73,7 +73,14 @@ FACE_LOG_MIN_SCORE = (
     if os.environ.get("FACE_LOG_MIN_SCORE")
     else None
 )
-# JSON lines file for that log, rotated at 100 MB; unset logs to stdout.
+# Detects animals down to this score and logs the ones below their species' min
+# score with their embedding, but answers only those at or above it. Unset: off.
+ANIMAL_LOG_MIN_SCORE = (
+    float(os.environ["ANIMAL_LOG_MIN_SCORE"])
+    if os.environ.get("ANIMAL_LOG_MIN_SCORE")
+    else None
+)
+# JSON lines file for both logs, rotated at 100 MB; unset logs to stdout.
 FACE_LOG_PATH = os.environ.get("FACE_LOG_PATH", "")
 
 if KEEP_HUMAN_FACES and not UPSTREAM_URL:
@@ -88,8 +95,12 @@ if INFERENCE_CONCURRENCY < 1 or EMBED_BATCH < 1:
     raise SystemExit(
         "animal-ml: INFERENCE_CONCURRENCY and EMBED_BATCH must be at least 1"
     )
-if FACE_LOG_MIN_SCORE is not None and not 0 <= FACE_LOG_MIN_SCORE <= 1:
-    raise SystemExit("animal-ml: FACE_LOG_MIN_SCORE must be between 0 and 1")
+for _name, _value in (
+    ("FACE_LOG_MIN_SCORE", FACE_LOG_MIN_SCORE),
+    ("ANIMAL_LOG_MIN_SCORE", ANIMAL_LOG_MIN_SCORE),
+):
+    if _value is not None and not 0 <= _value <= 1:
+        raise SystemExit(f"animal-ml: {_name} must be between 0 and 1")
 
 
 def _face_logger() -> logging.Logger:
@@ -109,7 +120,11 @@ def _face_logger() -> logging.Logger:
     return log
 
 
-_face_log = _face_logger() if FACE_LOG_MIN_SCORE is not None else None
+_face_log = (
+    _face_logger()
+    if FACE_LOG_MIN_SCORE is not None or ANIMAL_LOG_MIN_SCORE is not None
+    else None
+)
 
 
 def _session(name: str) -> tuple[ort.InferenceSession, str, tuple[int, int]]:
@@ -247,10 +262,14 @@ async def _unload_models_when_idle() -> None:
 
 
 def _detect(rgb: np.ndarray) -> list[tuple[float, list[int], _Species]]:
-    """Known-species detections above that species' min score, bbox in source pixels."""
+    """Known-species detections above that species' min score, bbox in source pixels.
+
+    With ANIMAL_LOG_MIN_SCORE below a species' min score, weaker ones are kept too.
+    """
     height, width = rgb.shape[:2]
     models = _models  # held by _acquire_models for the whole request
     species = models.species
+    floor = ANIMAL_LOG_MIN_SCORE if ANIMAL_LOG_MIN_SCORE is not None else 1.0
     blob, scale, left, top = letterbox(rgb, models.det_size)
     raw = models.detector.run(None, {models.det_input: blob})
     return [
@@ -265,7 +284,8 @@ def _detect(rgb: np.ndarray) -> list[tuple[float, list[int], _Species]]:
             species[int(class_id)],
         )
         for x1, y1, x2, y2, score, class_id in raw[0][0]
-        if int(class_id) in species and score >= species[int(class_id)].min_score
+        if int(class_id) in species
+        and score >= min(floor, species[int(class_id)].min_score)
     ]
 
 
@@ -401,22 +421,25 @@ async def predict(request: Request) -> Response:
     inference = asyncio.create_task(
         anyio.to_thread.run_sync(_animal_faces, rgb, limiter=_inference_limiter())
     )
+    human_log = None
     try:
         logged = _face_log_request(entries, image)
         if logged is None:
             humans = await _human_faces(body, content_type)
         else:
             lowered_body, lowered_type, min_score = logged
-            humans = _log_faces(
-                await _human_faces(lowered_body, lowered_type), min_score, image, rgb
-            )
+            all_humans = await _human_faces(lowered_body, lowered_type)
+            human_log = (all_humans, min_score)
+            humans = [f for f in all_humans if f.get("score", 0) >= min_score]
     except BaseException:
         # A photo still waiting for the limiter is dropped; one already running
         # finishes in its thread, and its result is discarded.
         inference.cancel()
         await asyncio.gather(inference, return_exceptions=True)
         raise
-    animals = await inference
+    animals, animal_log = await inference
+    if human_log is not None or ANIMAL_LOG_MIN_SCORE is not None:
+        _log_faces(image, rgb, human_log, animal_log)
     height, width = rgb.shape[:2]
     return ORJSONResponse(
         {TASK: animals + humans, "imageHeight": height, "imageWidth": width}
@@ -430,7 +453,7 @@ def _decode(data: bytes) -> np.ndarray:
     return cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB)
 
 
-def _animal_faces(rgb: np.ndarray) -> list[dict]:
+def _animal_faces(rgb: np.ndarray) -> tuple[list[dict], list[dict]]:
     _acquire_models()
     try:
         return _animal_faces_with_models(rgb)
@@ -438,7 +461,8 @@ def _animal_faces(rgb: np.ndarray) -> list[dict]:
         _release_models()
 
 
-def _animal_faces_with_models(rgb: np.ndarray) -> list[dict]:
+def _animal_faces_with_models(rgb: np.ndarray) -> tuple[list[dict], list[dict]]:
+    """Faces for Immich, and every detection for the log (empty when it is off)."""
     height, width = rgb.shape[:2]
     boxes, crops = [], []
     for score, bbox, kind in _detect(rgb):
@@ -448,17 +472,18 @@ def _animal_faces_with_models(rgb: np.ndarray) -> list[dict]:
             continue
         boxes.append(({"x1": x1, "y1": y1, "x2": x2, "y2": y2}, score))
         crops.append((crop, kind))
-    return [
-        {
-            "boundingBox": box,
-            # Immich expects the vector as a JSON string, not an array.
-            "embedding": orjson.dumps(
-                vector, option=orjson.OPT_SERIALIZE_NUMPY
-            ).decode(),
-            "score": score,
-        }
-        for (box, score), vector in zip(boxes, _embed(crops))
-    ]
+    faces, logged = [], []
+    for ((box, score), (_, kind)), vector in zip(zip(boxes, crops), _embed(crops)):
+        # Immich expects the vector as a JSON string, not an array.
+        embedding = orjson.dumps(vector, option=orjson.OPT_SERIALIZE_NUMPY).decode()
+        kept = score >= kind.min_score
+        if kept:
+            faces.append({"boundingBox": box, "embedding": embedding, "score": score})
+        if ANIMAL_LOG_MIN_SCORE is not None:
+            # Immich already stores the embedding of a kept face.
+            entry = {"species": kind.name, "score": score, "box": box}
+            logged.append(entry if kept else {**entry, "embedding": embedding})
+    return faces, logged
 
 
 def _face_log_request(entries: dict, image: bytes) -> tuple[bytes, str, float] | None:
@@ -483,26 +508,29 @@ def _face_log_request(entries: dict, image: bytes) -> tuple[bytes, str, float] |
 
 
 def _log_faces(
-    faces: list[dict], min_score: float, image: bytes, rgb: np.ndarray
-) -> list[dict]:
+    image: bytes,
+    rgb: np.ndarray,
+    human_log: tuple[list[dict], float] | None,
+    animals: list[dict],
+) -> None:
     # The request carries no asset ID; the SHA-1 of the preview finds the asset.
     height, width = rgb.shape[:2]
-    _face_log.info(
-        orjson.dumps(
-            {
-                "time": time.time(),
-                "sha1": hashlib.sha1(image).hexdigest(),
-                "width": width,
-                "height": height,
-                "minScore": min_score,
-                "faces": [
-                    {"score": face.get("score"), "box": face.get("boundingBox")}
-                    for face in faces
-                ],
-            }
-        ).decode()
-    )
-    return [face for face in faces if face.get("score", 0) >= min_score]
+    record = {
+        "time": time.time(),
+        "sha1": hashlib.sha1(image).hexdigest(),
+        "width": width,
+        "height": height,
+    }
+    if human_log is not None:
+        faces, min_score = human_log
+        record["minScore"] = min_score
+        record["faces"] = [
+            {"score": face.get("score"), "box": face.get("boundingBox")}
+            for face in faces
+        ]
+    if ANIMAL_LOG_MIN_SCORE is not None:
+        record["animals"] = animals
+    _face_log.info(orjson.dumps(record).decode())
 
 
 async def _human_faces(body: bytes, content_type: str) -> list[dict]:
