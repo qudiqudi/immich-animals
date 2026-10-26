@@ -1,0 +1,4 @@
+# Keep LF on every OS: SHA256SUMS fails its check with CRLF, and the image runs Linux.
+* text=auto eol=lf
+*.onnx binary
+*.webp binary
