@@ -628,3 +628,49 @@ def test_animal_detection_is_unchanged_without_animal_log(tmp_path, monkeypatch)
         0.5
     ]
     assert serve._face_log is None
+
+
+def _people_and_dogs_serve(tmp_path, monkeypatch, rows, **env):
+    _constant_model(
+        tmp_path / "detector.onnx",
+        [1, 3, 640, 640],
+        np.array([rows], np.float32),
+        names="{0: 'dog'}",
+    )
+    _embedder(tmp_path, "embedding", np.ones(512, np.float32))
+
+    def handler(request):
+        person = {"x1": 100, "y1": 100, "x2": 200, "y2": 220}
+        face = {"boundingBox": person, "embedding": "[0.1]", "score": 0.9}
+        return httpx.Response(200, json={"facial-recognition": [face]})
+
+    serve = _load_serve(tmp_path, monkeypatch, UPSTREAM_ML_URL="http://upstream", **env)
+    serve._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return serve
+
+
+def _answer_scores(serve) -> list[float]:
+    response = TestClient(serve.app).post(
+        "/predict", data={"entries": json.dumps(ENTRIES)}, files={"image": _image()}
+    )
+    return sorted(round(f["score"], 2) for f in response.json()["facial-recognition"])
+
+
+def test_animal_boxes_on_a_person_are_dropped(tmp_path, monkeypatch):
+    rows = [
+        [105, 105, 195, 215, 0.40, 0],  # the same head as the person: dropped
+        [0, 0, 640, 640, 0.35, 0],  # the whole photo around the person: dropped
+        [400, 400, 500, 500, 0.50, 0],  # a real dog elsewhere: kept
+    ]
+    serve = _people_and_dogs_serve(tmp_path, monkeypatch, rows)
+
+    assert _answer_scores(serve) == [0.5, 0.9]
+
+
+def test_animal_boxes_on_a_person_stay_when_disabled(tmp_path, monkeypatch):
+    rows = [[105, 105, 195, 215, 0.40, 0]]
+    serve = _people_and_dogs_serve(
+        tmp_path, monkeypatch, rows, DROP_ANIMALS_ON_PEOPLE="false"
+    )
+
+    assert _answer_scores(serve) == [0.4, 0.9]

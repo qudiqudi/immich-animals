@@ -99,6 +99,7 @@ Add them under `environment:` in the `docker-compose.override.yml` from step 1, 
 | --- | --- | --- |
 | `UPSTREAM_ML_URL` | — | Your existing Immich ML container. Required: search and OCR are forwarded to it. |
 | `KEEP_HUMAN_FACES` | `true` | `false` serves pets only and stops detecting human faces. A refresh will delete all human face edits you have made |
+| `DROP_ANIMALS_ON_PEOPLE` | `true` | Drops an animal box that covers a human face (IoU 0.5 or more, or the face 90 % inside it). The detector now and then takes a human head for a dog or cat, and Immich then shows that person twice in one photo. A refresh removes such duplicates. |
 | `DOG_MIN_SCORE` | `0.3` | How confident the detector must be for a dog. Lower finds more dogs and more wolves and foxes. Just requires a refresh. |
 | `DOG_MAX_DISTANCE` | `0.375` | **SEE NOTE BELOW** How alike two dogs must look to count as the same dog. Lower splits more, higher merges more. |
 | `CAT_MIN_SCORE` | `0.3` | As `DOG_MIN_SCORE`, for cats. |

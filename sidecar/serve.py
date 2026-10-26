@@ -73,6 +73,13 @@ FACE_LOG_MIN_SCORE = (
     if os.environ.get("FACE_LOG_MIN_SCORE")
     else None
 )
+# The animal detector also finds human heads now and then; Immich then shows the
+# same person twice in one photo. Drops an animal box that overlaps a human face.
+DROP_ANIMALS_ON_PEOPLE = os.environ.get("DROP_ANIMALS_ON_PEOPLE", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 # Detects animals down to this score and logs the ones below their species' min
 # score with their embedding, but answers only those at or above it. Unset: off.
 ANIMAL_LOG_MIN_SCORE = (
@@ -438,12 +445,39 @@ async def predict(request: Request) -> Response:
         await asyncio.gather(inference, return_exceptions=True)
         raise
     animals, animal_log = await inference
+    if DROP_ANIMALS_ON_PEOPLE and humans:
+        people = [f["boundingBox"] for f in humans if "boundingBox" in f]
+        animals = [a for a in animals if not _on_person(a["boundingBox"], people)]
+        for entry in animal_log:
+            if _on_person(entry["box"], people):
+                entry["onPerson"] = True
     if human_log is not None or ANIMAL_LOG_MIN_SCORE is not None:
         _log_faces(image, rgb, human_log, animal_log)
     height, width = rgb.shape[:2]
     return ORJSONResponse(
         {TASK: animals + humans, "imageHeight": height, "imageWidth": width}
     )
+
+
+def _on_person(box: dict, people: list[dict]) -> bool:
+    """True if the animal box is the same area as a human face, or holds one whole.
+
+    IoU alone misses the animal box around a whole head or the whole photo.
+    """
+
+    def area(b: dict) -> float:
+        return max(0.0, b["x2"] - b["x1"]) * max(0.0, b["y2"] - b["y1"])
+
+    for person in people:
+        ix = min(box["x2"], person["x2"]) - max(box["x1"], person["x1"])
+        iy = min(box["y2"], person["y2"]) - max(box["y1"], person["y1"])
+        inter = max(0.0, ix) * max(0.0, iy)
+        union = area(box) + area(person) - inter
+        if union and inter / union >= 0.5:
+            return True
+        if area(person) and inter / area(person) >= 0.9:
+            return True
+    return False
 
 
 def _decode(data: bytes) -> np.ndarray:
