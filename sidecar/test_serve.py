@@ -4,6 +4,7 @@ Usage: uv run --project sidecar pytest sidecar
 """
 
 import asyncio
+import hashlib
 import importlib.util
 import json
 import threading
@@ -474,3 +475,98 @@ def test_queued_inference_is_dropped_when_upstream_fails(tmp_path, monkeypatch):
 
     assert asyncio.run(scenario()).status_code == 503
     assert detected == []
+
+
+def _face_log_serve(tmp_path, monkeypatch, handler, **env):
+    _constant_model(
+        tmp_path / "detector.onnx",
+        [1, 3, 640, 640],
+        np.zeros((1, 1, 6), np.float32),
+        names="{0: 'dog'}",
+    )
+    _embedder(tmp_path, "embedding", np.ones(512, np.float32))
+    serve = _load_serve(tmp_path, monkeypatch, UPSTREAM_ML_URL="http://upstream", **env)
+    serve._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return serve
+
+
+def _human(score: float) -> dict:
+    box = {"x1": 1, "y1": 2, "x2": 30, "y2": 40}
+    return {"boundingBox": box, "embedding": "[0.1]", "score": score}
+
+
+def test_face_log_asks_lower_logs_all_and_answers_immichs_min_score(
+    tmp_path, monkeypatch
+):
+    sent = []
+
+    def handler(request):
+        sent.append(request.content)
+        faces = [_human(0.9), _human(0.55), _human(0.41)]
+        return httpx.Response(200, json={"facial-recognition": faces})
+
+    log_path = tmp_path / "faces.jsonl"
+    serve = _face_log_serve(
+        tmp_path,
+        monkeypatch,
+        handler,
+        FACE_LOG_MIN_SCORE="0.4",
+        FACE_LOG_PATH=str(log_path),
+    )
+    image = _image()
+    response = TestClient(serve.app).post(
+        "/predict", data={"entries": json.dumps(ENTRIES)}, files={"image": image}
+    )
+
+    assert [f["score"] for f in response.json()["facial-recognition"]] == [0.9]
+    assert b'"minScore":0.4' in sent[0] and image in sent[0]
+    record = json.loads(log_path.read_text().splitlines()[-1])
+    assert record["minScore"] == 0.7
+    assert [f["score"] for f in record["faces"]] == [0.9, 0.55, 0.41]
+    assert record["sha1"] == hashlib.sha1(image).hexdigest()
+
+
+def test_face_requests_are_untouched_without_face_log(tmp_path, monkeypatch):
+    sent = []
+
+    def handler(request):
+        sent.append(request.content)
+        return httpx.Response(200, json={"facial-recognition": [_human(0.5)]})
+
+    monkeypatch.delenv("FACE_LOG_MIN_SCORE", raising=False)
+    serve = _face_log_serve(tmp_path, monkeypatch, handler)
+    response = TestClient(serve.app).post(
+        "/predict", data={"entries": json.dumps(ENTRIES)}, files={"image": _image()}
+    )
+
+    # Without the log the sidecar does not filter what upstream found.
+    assert [f["score"] for f in response.json()["facial-recognition"]] == [0.5]
+    assert b'"minScore": 0.7' in sent[0]
+
+
+def test_face_log_forwards_unknown_entries_as_they_came(tmp_path, monkeypatch):
+    sent = []
+
+    def handler(request):
+        sent.append(request.content)
+        return httpx.Response(200, json={"facial-recognition": []})
+
+    serve = _face_log_serve(tmp_path, monkeypatch, handler, FACE_LOG_MIN_SCORE="0.4")
+    entries = {"facial-recognition": {"detection": {}}}
+    response = TestClient(serve.app).post(
+        "/predict", data={"entries": json.dumps(entries)}, files={"image": _image()}
+    )
+
+    assert response.status_code == 200
+    assert b'"detection": {}' in sent[0]
+
+
+def test_invalid_face_log_min_score_refuses_to_start(tmp_path, monkeypatch):
+    try:
+        _plain_serve(
+            tmp_path, monkeypatch, KEEP_HUMAN_FACES="false", FACE_LOG_MIN_SCORE="1.5"
+        )
+    except SystemExit as error:
+        assert "between 0 and 1" in str(error)
+    else:
+        raise AssertionError("serve started with FACE_LOG_MIN_SCORE=1.5")

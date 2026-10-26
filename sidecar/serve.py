@@ -14,11 +14,13 @@ retune settings that are already right for people.
 
 import ast
 import asyncio
+import copy
 import ctypes
 import gc
 import hashlib
 import json
 import logging
+import logging.handlers
 import os
 import threading
 import time
@@ -64,6 +66,15 @@ INFERENCE_CONCURRENCY = int(os.environ.get("INFERENCE_CONCURRENCY", "1"))
 EMBED_BATCH = int(os.environ.get("EMBED_BATCH", "8"))
 # Seconds without a request after which the models are unloaded; 0 keeps them.
 MODEL_TTL = float(os.environ.get("MODEL_TTL", "0"))
+# Asks upstream for human faces down to this score and logs them all, but still
+# answers only those above Immich's own min score. Unset leaves requests untouched.
+FACE_LOG_MIN_SCORE = (
+    float(os.environ["FACE_LOG_MIN_SCORE"])
+    if os.environ.get("FACE_LOG_MIN_SCORE")
+    else None
+)
+# JSON lines file for that log, rotated at 100 MB; unset logs to stdout.
+FACE_LOG_PATH = os.environ.get("FACE_LOG_PATH", "")
 
 if KEEP_HUMAN_FACES and not UPSTREAM_URL:
     # Answering with animals only would look like a complete result, and an Immich
@@ -77,6 +88,28 @@ if INFERENCE_CONCURRENCY < 1 or EMBED_BATCH < 1:
     raise SystemExit(
         "animal-ml: INFERENCE_CONCURRENCY and EMBED_BATCH must be at least 1"
     )
+if FACE_LOG_MIN_SCORE is not None and not 0 <= FACE_LOG_MIN_SCORE <= 1:
+    raise SystemExit("animal-ml: FACE_LOG_MIN_SCORE must be between 0 and 1")
+
+
+def _face_logger() -> logging.Logger:
+    log = logging.getLogger("animal-ml.faces")
+    log.propagate = False
+    log.setLevel(logging.INFO)
+    for handler in log.handlers[:]:  # a reload must not keep an old target
+        log.removeHandler(handler)
+        handler.close()
+    log.addHandler(
+        logging.handlers.RotatingFileHandler(
+            FACE_LOG_PATH, maxBytes=100 * 1024 * 1024, backupCount=5
+        )
+        if FACE_LOG_PATH
+        else logging.StreamHandler()
+    )
+    return log
+
+
+_face_log = _face_logger() if FACE_LOG_MIN_SCORE is not None else None
 
 
 def _session(name: str) -> tuple[ort.InferenceSession, str, tuple[int, int]]:
@@ -361,14 +394,22 @@ async def predict(request: Request) -> Response:
             media_type=upstream.headers.get("content-type"),
         )
 
-    rgb = await anyio.to_thread.run_sync(_decode, await form["image"].read())
+    image = await form["image"].read()
+    rgb = await anyio.to_thread.run_sync(_decode, image)
     # ONNX runs in a worker thread so the event loop keeps serving pings, CLIP and
     # the upstream face request while animals are inferred.
     inference = asyncio.create_task(
         anyio.to_thread.run_sync(_animal_faces, rgb, limiter=_inference_limiter())
     )
     try:
-        humans = await _human_faces(body, content_type)
+        logged = _face_log_request(entries, image)
+        if logged is None:
+            humans = await _human_faces(body, content_type)
+        else:
+            lowered_body, lowered_type, min_score = logged
+            humans = _log_faces(
+                await _human_faces(lowered_body, lowered_type), min_score, image, rgb
+            )
     except BaseException:
         # A photo still waiting for the limiter is dropped; one already running
         # finishes in its thread, and its result is discarded.
@@ -418,6 +459,50 @@ def _animal_faces_with_models(rgb: np.ndarray) -> list[dict]:
         }
         for (box, score), vector in zip(boxes, _embed(crops))
     ]
+
+
+def _face_log_request(entries: dict, image: bytes) -> tuple[bytes, str, float] | None:
+    """The face request with the lower min score, or None to send Immich's own."""
+    if FACE_LOG_MIN_SCORE is None:
+        return None
+    try:
+        min_score = float(entries[TASK]["detection"]["options"]["minScore"])
+    except (KeyError, TypeError, ValueError):
+        return None  # an unknown shape is forwarded as it came
+    if FACE_LOG_MIN_SCORE >= min_score:
+        return None
+    lowered = copy.deepcopy(entries)
+    lowered[TASK]["detection"]["options"]["minScore"] = FACE_LOG_MIN_SCORE
+    request = httpx.Request(
+        "POST",
+        "http://upstream/predict",
+        data={"entries": orjson.dumps(lowered).decode()},
+        files={"image": ("image", image)},
+    )
+    return request.read(), request.headers["content-type"], min_score
+
+
+def _log_faces(
+    faces: list[dict], min_score: float, image: bytes, rgb: np.ndarray
+) -> list[dict]:
+    # The request carries no asset ID; the SHA-1 of the preview finds the asset.
+    height, width = rgb.shape[:2]
+    _face_log.info(
+        orjson.dumps(
+            {
+                "time": time.time(),
+                "sha1": hashlib.sha1(image).hexdigest(),
+                "width": width,
+                "height": height,
+                "minScore": min_score,
+                "faces": [
+                    {"score": face.get("score"), "box": face.get("boundingBox")}
+                    for face in faces
+                ],
+            }
+        ).decode()
+    )
+    return [face for face in faces if face.get("score", 0) >= min_score]
 
 
 async def _human_faces(body: bytes, content_type: str) -> list[dict]:
