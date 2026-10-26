@@ -73,12 +73,24 @@ FACE_LOG_MIN_SCORE = (
     if os.environ.get("FACE_LOG_MIN_SCORE")
     else None
 )
-# The animal detector also finds human heads now and then; Immich then shows the
-# same person twice in one photo. Drops an animal box that overlaps a human face.
-DROP_ANIMALS_ON_PEOPLE = os.environ.get("DROP_ANIMALS_ON_PEOPLE", "true").lower() in {
+# Each detector also finds the other kind now and then: the animal one takes a human
+# head for a dog or cat, upstream takes a dog's face for a person. Immich then shows
+# one face twice. Where a human face and an animal box overlap, upstream CLIP looks
+# at both crops and the wrong one is dropped. Pets next to people stay.
+OVERLAP_CHECK = os.environ.get("OVERLAP_CHECK", "true").lower() in {
     "1",
     "true",
     "yes",
+}
+# The CLIP model Immich uses for smart search; upstream already has it loaded.
+OVERLAP_CLIP_MODEL = os.environ.get("OVERLAP_CLIP_MODEL", "ViT-L-16-SigLIP2-256__webli")
+# How far "dog"/"cat" must beat "person" on a human face crop before it is dropped.
+# Cuddling pets lean a face crop towards the pet by up to about 0.03.
+OVERLAP_ANIMAL_MARGIN = float(os.environ.get("OVERLAP_ANIMAL_MARGIN", "0.05"))
+OVERLAP_PROMPTS = {
+    "person": ["a photo of a person's face", "a photo of a person"],
+    "dog": ["a photo of a dog", "a photo of a dog's face"],
+    "cat": ["a photo of a cat", "a photo of a cat's face"],
 }
 # Detects animals down to this score and logs the ones below their species' min
 # score with their embedding, but answers only those at or above it. Unset: off.
@@ -445,12 +457,8 @@ async def predict(request: Request) -> Response:
         await asyncio.gather(inference, return_exceptions=True)
         raise
     animals, animal_log = await inference
-    if DROP_ANIMALS_ON_PEOPLE and humans:
-        people = [f["boundingBox"] for f in humans if "boundingBox" in f]
-        animals = [a for a in animals if not _on_person(a["boundingBox"], people)]
-        for entry in animal_log:
-            if _on_person(entry["box"], people):
-                entry["onPerson"] = True
+    if OVERLAP_CHECK and humans and animals:
+        animals, humans = await _resolve_overlaps(rgb, animals, humans, animal_log)
     if human_log is not None or ANIMAL_LOG_MIN_SCORE is not None:
         _log_faces(image, rgb, human_log, animal_log)
     height, width = rgb.shape[:2]
@@ -459,8 +467,8 @@ async def predict(request: Request) -> Response:
     )
 
 
-def _on_person(box: dict, people: list[dict]) -> bool:
-    """True if the animal box is the same area as a human face, or holds one whole.
+def _overlaps(box: dict, person: dict) -> bool:
+    """The animal box is the same area as the human face, or holds it whole.
 
     IoU alone misses the animal box around a whole head or the whole photo.
     """
@@ -468,16 +476,101 @@ def _on_person(box: dict, people: list[dict]) -> bool:
     def area(b: dict) -> float:
         return max(0.0, b["x2"] - b["x1"]) * max(0.0, b["y2"] - b["y1"])
 
-    for person in people:
-        ix = min(box["x2"], person["x2"]) - max(box["x1"], person["x1"])
-        iy = min(box["y2"], person["y2"]) - max(box["y1"], person["y1"])
-        inter = max(0.0, ix) * max(0.0, iy)
-        union = area(box) + area(person) - inter
-        if union and inter / union >= 0.5:
-            return True
-        if area(person) and inter / area(person) >= 0.9:
-            return True
-    return False
+    ix = min(box["x2"], person["x2"]) - max(box["x1"], person["x1"])
+    iy = min(box["y2"], person["y2"]) - max(box["y1"], person["y1"])
+    inter = max(0.0, ix) * max(0.0, iy)
+    union = area(box) + area(person) - inter
+    return bool(
+        (union and inter / union >= 0.5)
+        or (area(person) and inter / area(person) >= 0.9)
+    )
+
+
+_overlap_text: np.ndarray | None = None  # rows in OVERLAP_PROMPTS order
+
+
+async def _clip_vector(
+    entries: dict, text: str | None = None, files: dict | None = None
+) -> np.ndarray:
+    form = {"entries": orjson.dumps(entries).decode()}
+    if text is not None:
+        form["text"] = text
+    try:
+        response = await _upstream("POST", "/predict", data=form, files=files)
+        response.raise_for_status()
+        vector = np.asarray(orjson.loads(orjson.loads(response.content)["clip"]))
+    except (httpx.HTTPError, orjson.JSONDecodeError, KeyError, TypeError) as error:
+        # A guess would make refreshes disagree with each other; Immich retries.
+        raise HTTPException(503, f"Upstream CLIP failed: {error!r}") from error
+    return vector / np.linalg.norm(vector)
+
+
+async def _overlap_scores(crop: np.ndarray) -> np.ndarray:
+    """Cosine similarity of a crop with each kind in OVERLAP_PROMPTS."""
+    global _overlap_text
+    if _overlap_text is None:
+        rows = []
+        for prompts in OVERLAP_PROMPTS.values():
+            vectors = []
+            for prompt in prompts:
+                textual = {"clip": {"textual": {"modelName": OVERLAP_CLIP_MODEL}}}
+                vectors.append(await _clip_vector(textual, text=prompt))
+            mean = np.mean(vectors, axis=0)
+            rows.append(mean / np.linalg.norm(mean))
+        _overlap_text = np.stack(rows)
+    ok, jpeg = cv2.imencode(".jpg", cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
+    if not ok:
+        raise HTTPException(500, "Could not encode an overlap crop")
+    visual = {"clip": {"visual": {"modelName": OVERLAP_CLIP_MODEL}}}
+    return _overlap_text @ await _clip_vector(
+        visual, files={"image": ("crop.jpg", jpeg.tobytes())}
+    )
+
+
+def _crop(rgb: np.ndarray, box: dict) -> np.ndarray:
+    height, width = rgb.shape[:2]
+    x1, y1 = max(0, int(box["x1"])), max(0, int(box["y1"]))
+    x2, y2 = min(width, int(box["x2"])), min(height, int(box["y2"]))
+    return rgb[y1 : max(y2, y1 + 1), x1 : max(x2, x1 + 1)]
+
+
+async def _resolve_overlaps(
+    rgb: np.ndarray, animals: list[dict], humans: list[dict], animal_log: list[dict]
+) -> tuple[list[dict], list[dict]]:
+    """Drop the wrong face of every human/animal pair that covers the same area.
+
+    An animal box that CLIP calls a person goes. Otherwise a human face that CLIP
+    calls a dog or cat by OVERLAP_ANIMAL_MARGIN goes. Otherwise both stay.
+    """
+    person = list(OVERLAP_PROMPTS).index("person")
+    dropped_animals, dropped_humans, scores = set(), set(), {}
+
+    async def kind_scores(key: tuple, box: dict) -> np.ndarray:
+        if key not in scores:
+            scores[key] = await _overlap_scores(_crop(rgb, box))
+        return scores[key]
+
+    for a, animal in enumerate(animals):
+        for h, human in enumerate(humans):
+            if h in dropped_humans or "boundingBox" not in human:
+                continue
+            if not _overlaps(animal["boundingBox"], human["boundingBox"]):
+                continue
+            red = await kind_scores(("animal", a), animal["boundingBox"])
+            if int(np.argmax(red)) == person:
+                dropped_animals.add(a)
+                break
+            green = await kind_scores(("human", h), human["boundingBox"])
+            if np.delete(green, person).max() - green[person] >= OVERLAP_ANIMAL_MARGIN:
+                dropped_humans.add(h)
+    for entry in animal_log:
+        for a in dropped_animals:
+            if entry["box"] == animals[a]["boundingBox"]:
+                entry["overlap"] = "person"
+    return (
+        [x for i, x in enumerate(animals) if i not in dropped_animals],
+        [x for i, x in enumerate(humans) if i not in dropped_humans],
+    )
 
 
 def _decode(data: bytes) -> np.ndarray:

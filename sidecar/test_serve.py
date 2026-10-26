@@ -630,7 +630,11 @@ def test_animal_detection_is_unchanged_without_animal_log(tmp_path, monkeypatch)
     assert serve._face_log is None
 
 
-def _people_and_dogs_serve(tmp_path, monkeypatch, rows, **env):
+PERSON_BOX = {"x1": 100, "y1": 100, "x2": 200, "y2": 220}
+
+
+def _overlap_serve(tmp_path, monkeypatch, rows, clip_handler=None, **env):
+    """serve with one human face upstream at PERSON_BOX and the given dog rows."""
     _constant_model(
         tmp_path / "detector.onnx",
         [1, 3, 640, 640],
@@ -640,9 +644,10 @@ def _people_and_dogs_serve(tmp_path, monkeypatch, rows, **env):
     _embedder(tmp_path, "embedding", np.ones(512, np.float32))
 
     def handler(request):
-        person = {"x1": 100, "y1": 100, "x2": 200, "y2": 220}
-        face = {"boundingBox": person, "embedding": "[0.1]", "score": 0.9}
-        return httpx.Response(200, json={"facial-recognition": [face]})
+        if b"facial-recognition" in request.content:
+            face = {"boundingBox": PERSON_BOX, "embedding": "[0.1]", "score": 0.9}
+            return httpx.Response(200, json={"facial-recognition": [face]})
+        return clip_handler(request)
 
     serve = _load_serve(tmp_path, monkeypatch, UPSTREAM_ML_URL="http://upstream", **env)
     serve._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -653,24 +658,87 @@ def _answer_scores(serve) -> list[float]:
     response = TestClient(serve.app).post(
         "/predict", data={"entries": json.dumps(ENTRIES)}, files={"image": _image()}
     )
+    assert response.status_code == 200, response.text
     return sorted(round(f["score"], 2) for f in response.json()["facial-recognition"])
 
 
-def test_animal_boxes_on_a_person_are_dropped(tmp_path, monkeypatch):
+def _kinds_by_crop_width(serve, monkeypatch, kinds: dict[int, list[float]]):
+    """CLIP stand-in: the crop width picks the [person, dog, cat] scores."""
+
+    async def scores(crop):
+        return np.array(kinds[crop.shape[1]], np.float32)
+
+    monkeypatch.setattr(serve, "_overlap_scores", scores)
+
+
+def test_animal_box_that_clip_calls_a_person_is_dropped(tmp_path, monkeypatch):
     rows = [
-        [105, 105, 195, 215, 0.40, 0],  # the same head as the person: dropped
-        [0, 0, 640, 640, 0.35, 0],  # the whole photo around the person: dropped
-        [400, 400, 500, 500, 0.50, 0],  # a real dog elsewhere: kept
+        [105, 105, 195, 215, 0.93, 0],  # a head taken for a dog, even at a high score
+        [400, 400, 500, 500, 0.50, 0],  # a dog elsewhere: not checked, kept
     ]
-    serve = _people_and_dogs_serve(tmp_path, monkeypatch, rows)
+    serve = _overlap_serve(tmp_path, monkeypatch, rows)
+    # The padded dog box around the head is 108 px wide.
+    _kinds_by_crop_width(serve, monkeypatch, {108: [0.10, 0.02, 0.03]})
 
     assert _answer_scores(serve) == [0.5, 0.9]
 
 
-def test_animal_boxes_on_a_person_stay_when_disabled(tmp_path, monkeypatch):
-    rows = [[105, 105, 195, 215, 0.40, 0]]
-    serve = _people_and_dogs_serve(
-        tmp_path, monkeypatch, rows, DROP_ANIMALS_ON_PEOPLE="false"
+def test_pet_next_to_a_person_keeps_both_faces(tmp_path, monkeypatch):
+    rows = [[0, 0, 640, 640, 0.93, 0]]  # a big dog box around the whole photo
+    serve = _overlap_serve(tmp_path, monkeypatch, rows)
+    # The dog crop looks like a dog; the face crop leans a little towards the dog.
+    _kinds_by_crop_width(
+        serve, monkeypatch, {640: [0.05, 0.12, 0.04], 100: [0.10, 0.12, 0.05]}
     )
 
-    assert _answer_scores(serve) == [0.4, 0.9]
+    assert _answer_scores(serve) == [0.9, 0.93]
+
+
+def test_human_face_that_clip_calls_a_dog_is_dropped(tmp_path, monkeypatch):
+    rows = [[90, 90, 210, 230, 0.93, 0]]  # the dog's head, also found as a person
+    serve = _overlap_serve(tmp_path, monkeypatch, rows)
+    _kinds_by_crop_width(
+        serve, monkeypatch, {144: [0.05, 0.14, 0.06], 100: [0.05, 0.15, 0.07]}
+    )
+
+    assert _answer_scores(serve) == [0.93]
+
+
+def test_overlap_check_asks_upstream_clip_and_refuses_when_it_fails(
+    tmp_path, monkeypatch
+):
+    seen, fail = [], [False]
+
+    def clip_handler(request):
+        if fail[0]:
+            return httpx.Response(500)
+        body = request.content
+        # A text request has no file, so httpx sends it form-urlencoded, as the
+        # CLIP test against the real immich-ml did.
+        seen.append(b"text=" in body or b'name="text"' in body)
+        if b'"textual"' in body:
+            index = 0 if b"person" in body else 1 if b"dog" in body else 2
+            vector = np.eye(3)[index].tolist()
+        else:  # every crop looks like a person
+            vector = [1.0, 0.0, 0.0]
+        return httpx.Response(200, json={"clip": json.dumps(vector)})
+
+    rows = [[105, 105, 195, 215, 0.93, 0]]
+    serve = _overlap_serve(tmp_path, monkeypatch, rows, clip_handler)
+
+    assert _answer_scores(serve) == [0.9]
+    assert seen.count(True) == 6 and seen.count(False) == 1  # 6 prompts, 1 crop
+
+    fail[0] = True
+    serve._overlap_text = None
+    response = TestClient(serve.app).post(
+        "/predict", data={"entries": json.dumps(ENTRIES)}, files={"image": _image()}
+    )
+    assert response.status_code == 503
+
+
+def test_overlapping_faces_stay_without_the_check(tmp_path, monkeypatch):
+    rows = [[105, 105, 195, 215, 0.93, 0]]
+    serve = _overlap_serve(tmp_path, monkeypatch, rows, OVERLAP_CHECK="false")
+
+    assert _answer_scores(serve) == [0.9, 0.93]

@@ -99,7 +99,9 @@ Add them under `environment:` in the `docker-compose.override.yml` from step 1, 
 | --- | --- | --- |
 | `UPSTREAM_ML_URL` | — | Your existing Immich ML container. Required: search and OCR are forwarded to it. |
 | `KEEP_HUMAN_FACES` | `true` | `false` serves pets only and stops detecting human faces. A refresh will delete all human face edits you have made |
-| `DROP_ANIMALS_ON_PEOPLE` | `true` | Drops an animal box that covers a human face (IoU 0.5 or more, or the face 90 % inside it). The detector now and then takes a human head for a dog or cat, and Immich then shows that person twice in one photo. A refresh removes such duplicates. |
+| `OVERLAP_CHECK` | `true` | Each detector sometimes finds the other kind: the animal one takes a human head for a dog or cat, upstream takes a dog's face for a person, and Immich shows one face twice. Where a human face and an animal box overlap (IoU 0.5 or more, or the face 90 % inside the box), upstream CLIP looks at both crops. An animal box that looks like a person is dropped; a human face that looks like a dog or cat by `OVERLAP_ANIMAL_MARGIN` is dropped; otherwise both stay, so pets next to people are kept. If CLIP fails the face request answers 503, so a refresh never sees a guess. |
+| `OVERLAP_CLIP_MODEL` | `ViT-L-16-SigLIP2-256__webli` | The CLIP model upstream uses for smart search. Set it to the one in your Immich settings. |
+| `OVERLAP_ANIMAL_MARGIN` | `0.05` | How far "dog" or "cat" must beat "person" on a human face crop before that face is dropped. Faces of people cuddling a pet lean towards the pet by up to about 0.03. |
 | `DOG_MIN_SCORE` | `0.3` | How confident the detector must be for a dog. Lower finds more dogs and more wolves and foxes. Just requires a refresh. |
 | `DOG_MAX_DISTANCE` | `0.375` | **SEE NOTE BELOW** How alike two dogs must look to count as the same dog. Lower splits more, higher merges more. |
 | `CAT_MIN_SCORE` | `0.3` | As `DOG_MIN_SCORE`, for cats. |
